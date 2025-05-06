@@ -1,0 +1,12 @@
+services:
+  act:
+    image: pytorch/pytorch:2.7.0-cuda11.8-cudnn9-runtime
+    container_name: act4isaacsim
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./:/workspace
+    working_dir: /workspace
+    tty: true
+    stdin_open: true
