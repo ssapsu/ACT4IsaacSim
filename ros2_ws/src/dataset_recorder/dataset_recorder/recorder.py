@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 ACT-policy용 HDF5 샘플링 레코더
-- 4개 이미지 + semantic_labels + odom + joint_states 전부 placeholder 포함 동기 녹화
+- 4개 이미지 + odom + joint_states 전부 placeholder 포함 동기 녹화
 - /start_record, /stop_record 서비스로 에피소드 제어
 - sample_rate (Hz) 파라미터로 저장 주기 지정
+- stop_record 시점에 별도 HDF5 파일로 export (EpisodicDataset 호환 포맷)
 """
 import os
 import threading
@@ -26,7 +27,6 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import Image, JointState
 from nav_msgs.msg import Odometry
-from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 
@@ -63,15 +63,9 @@ class SampledSyncRecorder(Node):
 
         # buffers
         self.bridge = CvBridge()
-        self.label_buf = deque(maxlen=200)
         self.odom_buf = deque(maxlen=200)
         self.joint_buf = deque(maxlen=200)
-        self.img_buf = {
-            "color": None,
-            "depth": None,
-            "left_color": None,
-            "semantic_segmentation": None,
-        }
+        self.img_buf = {"color": None, "depth": None, "left_color": None}
         self.joint_initialized = False
         self.state_dim = None
         self.joint_lock = threading.Lock()
@@ -84,7 +78,7 @@ class SampledSyncRecorder(Node):
             depth=1,
         )
 
-        # image subscribers (latest buffer)
+        # image subscribers
         self.create_subscription(
             Image,
             "/camera/color",
@@ -103,22 +97,9 @@ class SampledSyncRecorder(Node):
             lambda msg: self._img_cb("left_color", msg, "bgr8"),
             qos_profile=sensor_qos,
         )
-        self.create_subscription(
-            Image,
-            "/camera/semantic_segmentation",
-            lambda msg: self._img_cb("semantic_segmentation", msg, "passthrough"),
-            qos_profile=sensor_qos,
-        )
 
         # other topic buffers
         cbg = ReentrantCallbackGroup()
-        self.create_subscription(
-            String,
-            "/camera/semantic_labels",
-            self.cb_labels_buffer,
-            10,
-            callback_group=cbg,
-        )
         self.create_subscription(
             Odometry, "/odom", self.cb_odom_buffer, 10, callback_group=cbg
         )
@@ -141,25 +122,22 @@ class SampledSyncRecorder(Node):
 
     def _img_cb(self, key, msg, fmt):
         cv_img = self.bridge.imgmsg_to_cv2(msg, fmt)
+        if key in ["color", "left_color"]:
+            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         self.img_buf[key] = (msg.header.stamp, cv_img)
-
-    def cb_labels_buffer(self, msg):
-        ts = self.get_clock().now().nanoseconds * 1e-9
-        self.label_buf.append((ts, msg.data))
 
     def cb_odom_buffer(self, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-        self.odom_buf.append((ts, (p.x, p.y, p.z), (q.x, q.y, q.z, q.w)))
+        lin = msg.twist.twist.linear
+        ang = msg.twist.twist.angular
+        self.odom_buf.append((ts, (lin.x, lin.y, lin.z), (ang.x, ang.y, ang.z)))
 
     def cb_joints_buffer(self, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        self.joint_buf.append(
-            (ts, list(msg.position), list(msg.velocity), list(msg.effort))
-        )
+        self.joint_buf.append((ts, msg.name, list(msg.position)))
 
     def handle_start(self, req, res):
+        # open fullsync file
         if not self.h5:
             path = os.path.join(self.root, "sampled_fullsync.hdf5")
             self.h5 = h5py.File(path, "a")
@@ -184,15 +162,6 @@ class SampledSyncRecorder(Node):
                 key, shape=shape, maxshape=maxs, dtype=dtype, chunks=(1,) + shape[1:]
             )
 
-        lbl = self.ep_group.create_group("semantic_labels")
-        lbl.create_dataset(
-            "value",
-            shape=(0,),
-            dtype=h5py.string_dtype(),
-            maxshape=(None,),
-            chunks=(1,),
-        )
-
         od = self.ep_group.create_group("odom")
         od.create_dataset(
             "stamp", shape=(0,), dtype="float64", maxshape=(None,), chunks=(1,)
@@ -201,38 +170,47 @@ class SampledSyncRecorder(Node):
             "pos", shape=(0, 3), dtype="float64", maxshape=(None, 3), chunks=(1, 3)
         )
         od.create_dataset(
-            "orient", shape=(0, 4), dtype="float64", maxshape=(None, 4), chunks=(1, 4)
+            "orient", shape=(0, 3), dtype="float64", maxshape=(None, 3), chunks=(1, 3)
         )
         od.create_dataset(
             "cum_dist", shape=(0,), dtype="float64", maxshape=(None,), chunks=(1,)
         )
 
         js = self.ep_group.create_group("joint_states")
+        self.joint_initialized = False
 
+        # reset counters
         self.sync_count = 0
         self.ep_last_pos = None
         self.ep_cum_dist = 0.0
-        self.joint_initialized = False
-
         res.success = True
         res.message = "started"
         return res
 
     def handle_stop(self, req, res):
-        if self.h5 and self.ep_group:
-            self.episode_index += 1
-            self.ep_group = None
-            res.success = True
-            res.message = "stopped"
-        else:
+        if not self.ep_group:
             res.success = False
             res.message = "not recording"
+            return res
+
+        # export this episode
+        self._export_episode(self.episode_index)
+
+        # cleanup for next episode
+        self.ep_group = None
+        self.odom_buf.clear()
+        self.joint_buf.clear()
+        self.img_buf = {k: None for k in self.img_buf}
+        self.episode_index += 1
+
+        res.success = True
+        res.message = "stopped and exported"
         return res
 
     def cb_sample(self):
         if not self.ep_group:
             return
-        # get latest color timestamp
+        # timestamp
         entry = self.img_buf.get("color")
         if entry is None:
             return
@@ -240,60 +218,47 @@ class SampledSyncRecorder(Node):
         ts = stamp.sec + stamp.nanosec * 1e-9
         self.get_logger().info(f"Sample @ {ts:.6f}")
 
-        # prepare image arrays
+        # collect images
         arrs = {}
         for key, entry in self.img_buf.items():
             if entry is None:
-                img = (
-                    np.zeros((self.cam_h, self.cam_w, 3), dtype="uint8")
-                    if key in ["color", "left_color"]
-                    else np.zeros((self.cam_h, self.cam_w), dtype="float32")
-                )
+                img = np.zeros((self.cam_h, self.cam_w, 3), dtype="uint8")
             else:
                 _, img0 = entry
-                interp = (
-                    cv2.INTER_AREA
-                    if key in ["color", "left_color"]
-                    else cv2.INTER_NEAREST
+                img = cv2.resize(
+                    img0, (self.cam_w, self.cam_h), interpolation=cv2.INTER_AREA
                 )
-                arr = cv2.resize(img0, (self.cam_w, self.cam_h), interpolation=interp)
-                if key in ["color", "left_color"]:
-                    arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-                img = arr
             arrs[key] = img
 
-        # pop nearest buffers
-        lbl = self._pop_nearest(self.label_buf, ts)
+        # pop nearest odom & joint
         od = self._pop_nearest(self.odom_buf, ts)
         jnt = self._pop_nearest(self.joint_buf, ts)
 
-        # placeholders
-        lbl_data = lbl or ""
-        if od is None:
-            od_ts, od_pos, od_ori = 0.0, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+        # placeholders / compute cum_dist
+        if od:
+            od_ts, od_pos, od_twist = od
         else:
-            od_ts, od_pos, od_ori = od
+            od_ts, od_pos, od_twist = 0.0, (0, 0, 0), (0, 0, 0)
         if self.ep_last_pos is None:
             self.ep_last_pos = np.array(od_pos)
         d = np.linalg.norm(np.array(od_pos) - self.ep_last_pos)
         self.ep_cum_dist += d
         self.ep_last_pos = np.array(od_pos)
 
-        if jnt is None and self.state_dim is not None:
-            zero = [0.0] * self.state_dim
-            j_ts, j_pos, j_vel, j_eff = 0.0, zero, zero, zero
-        elif jnt is not None:
-            j_ts, j_pos, j_vel, j_eff = jnt
+        if jnt:
+            j_ts, names, pos_all = jnt
         else:
-            j_ts, j_pos, j_vel, j_eff = 0.0, [], [], []
+            j_ts, names, pos_all = 0.0, [], []
 
-        # lazy init joint_states
+        # lazy init joint_states internal fullsync
         js_grp = self.ep_group["joint_states"]
         if not self.joint_initialized and jnt:
-            _, pos, vel, eff = jnt
-            self.state_dim = len(pos)
+            self.state_dim = len(pos_all)
             js_grp.create_dataset(
                 "stamp", shape=(0,), dtype="float64", maxshape=(None,), chunks=(1,)
+            )
+            js_grp.create_dataset(
+                "name", data=np.array(names, dtype="S"), dtype=h5py.string_dtype()
             )
             js_grp.create_dataset(
                 "position",
@@ -302,58 +267,34 @@ class SampledSyncRecorder(Node):
                 maxshape=(None, self.state_dim),
                 chunks=(1, self.state_dim),
             )
-            js_grp.create_dataset(
-                "velocity",
-                shape=(0, self.state_dim),
-                dtype="float32",
-                maxshape=(None, self.state_dim),
-                chunks=(1, self.state_dim),
-            )
-            js_grp.create_dataset(
-                "effort",
-                shape=(0, self.state_dim),
-                dtype="float32",
-                maxshape=(None, self.state_dim),
-                chunks=(1, self.state_dim),
-            )
             self.joint_initialized = True
 
-        # append at idx
         idx = self.sync_count
+        # append images
         imgs_grp = self.ep_group["images"]
-        lbl_ds = self.ep_group["semantic_labels"]["value"]
-        od_grp = self.ep_group["odom"]
-
-        # images
         for key, arr in arrs.items():
             ds = imgs_grp[key]
             ds.resize(idx + 1, axis=0)
             ds[idx] = arr
 
-        # semantic_labels
-        lbl_ds.resize(idx + 1, axis=0)
-        lbl_ds[idx] = lbl_data
-
-        # odom
-        od_grp["stamp"].resize(idx + 1, axis=0)
-        od_grp["stamp"][idx] = od_ts
-        od_grp["pos"].resize(idx + 1, axis=0)
-        od_grp["pos"][idx] = od_pos
-        od_grp["orient"].resize(idx + 1, axis=0)
-        od_grp["orient"][idx] = od_ori
-        od_grp["cum_dist"].resize(idx + 1, axis=0)
-        od_grp["cum_dist"][idx] = self.ep_cum_dist
+        # append odom
+        od_grp = self.ep_group["odom"]
+        for field, val in [
+            ("stamp", od_ts),
+            ("pos", od_pos),
+            ("orient", od_twist),
+            ("cum_dist", self.ep_cum_dist),
+        ]:
+            ds = od_grp[field]
+            ds.resize(idx + 1, axis=0)
+            ds[idx] = val
 
         # joint_states
-        if self.state_dim is not None:
+        if self.joint_initialized:
             js_grp["stamp"].resize(idx + 1, axis=0)
             js_grp["stamp"][idx] = j_ts
             js_grp["position"].resize(idx + 1, axis=0)
-            js_grp["position"][idx] = j_pos
-            js_grp["velocity"].resize(idx + 1, axis=0)
-            js_grp["velocity"][idx] = j_vel
-            js_grp["effort"].resize(idx + 1, axis=0)
-            js_grp["effort"][idx] = j_eff
+            js_grp["position"][idx] = pos_all
 
         self.sync_count += 1
 
@@ -367,6 +308,41 @@ class SampledSyncRecorder(Node):
             del buf[idx]
             return item
         return None
+
+    def _export_episode(self, ep_idx):
+        src = self.h5["episodes"][f"episode_{ep_idx}"]
+        out_path = os.path.join(self.root, f"episode_{ep_idx}.hdf5")
+        # --- prepare joint subset and odom speeds ---
+        names = [n.decode() for n in src["joint_states"]["name"][:]]
+        pos_all = src["joint_states"]["position"][:]
+        sel = [f"joint_{i}" for i in range(1, 7)] + ["Slider_1"]
+        idxs = [names.index(s) for s in sel]
+        pos_sel = pos_all[:, idxs]  # (T,7)
+        lin = src["odom"]["pos"][
+            :
+        ]  # misuse pos as linear? assume we stored twist in orient
+        ang = src["odom"]["orient"][:]
+        lin_speed = np.linalg.norm(lin, axis=1, keepdims=True)
+        ang_speed = np.linalg.norm(ang, axis=1, keepdims=True)
+        final_qpos = np.concatenate([pos_sel, lin_speed, ang_speed], axis=1)
+
+        # --- write new file ---
+        with h5py.File(out_path, "w") as dst:
+            dst.attrs["sim"] = True
+            obs = dst.create_group("observations")
+            imgs = obs.create_group("images")
+            for key in ["color", "depth", "left_color"]:
+                data = src["images"][key][:]
+                imgs.create_dataset(
+                    key,
+                    data=data,
+                    dtype=data.dtype,
+                    chunks=(1,) + data.shape[1:],
+                    compression="gzip",
+                    compression_opts=2,
+                )
+            obs.create_dataset("qpos", data=final_qpos.astype("float32"))
+        self.get_logger().info(f"Exported episode to {out_path}")
 
 
 def main():
