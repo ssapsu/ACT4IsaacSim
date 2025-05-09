@@ -226,15 +226,15 @@ class TransformerDecoderLayer(nn.Module):
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dif_feedforward=2048, dropout=0.1,
+    def __init__(self, d_model=512, nhead=8, num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, return_intermediate_dec=False):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dif_feedforward, dropout, activation, normalize_before)
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dif_feedforward, dropout, activation, normalize_before)
+        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm, return_intermediate_dec)
 
@@ -315,7 +315,7 @@ if __name__ == "__main__":
         nhead=8,
         num_encoder_layers=6,
         num_decoder_layers=6,
-        dif_feedforward=2048,
+        dim_feedforward=2048,
         dropout=0.1,
         return_intermediate_dec=True,
     )
