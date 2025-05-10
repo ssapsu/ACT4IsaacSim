@@ -80,7 +80,9 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-
+*log
+*install
+*build
 # IPython
 profile_default/
 ipython_config.py
