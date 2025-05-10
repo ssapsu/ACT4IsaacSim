@@ -1,11 +1,8 @@
-import numpy as np
 import torch
 import os
 import pickle
 import argparse
-import matplotlib.pyplot as plt
 from copy import deepcopy
-from einops import rearrange
 
 from utils import load_data, set_seed
 from policy import ACTPolicy
