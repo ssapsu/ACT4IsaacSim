@@ -30,7 +30,9 @@ from dataset_recorder.utils import set_seed
 def parse_args():
     parser = argparse.ArgumentParser("Custom ACT evaluator")
     # 필수 인자
-    parser.add_argument("--ckpt_dir", required=True)
+    parser.add_argument(
+        "--ckpt_dir", required=True, default="/home/hyeonsu/Documents/ACT4IsaacSim/ckpt"
+    )
     parser.add_argument("--ckpt_name", default="policy_best.ckpt")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--camera_names", nargs="+", default=["color", "left_color"])
