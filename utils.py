@@ -4,10 +4,6 @@ import os
 import h5py
 from torch.utils.data import DataLoader
 
-import IPython
-
-e = IPython.embed
-
 
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(
