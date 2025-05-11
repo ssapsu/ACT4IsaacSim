@@ -16,6 +16,7 @@ setup(
     entry_points={
         "console_scripts": [
             "recorder = dataset_recorder.recorder:main",
+            "ACTPolicy = dataset_recorder.actpolicy:main",
         ],
     },
 )
