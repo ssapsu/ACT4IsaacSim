@@ -18,25 +18,16 @@ def main(args):
     ckpt_dir = args.ckpt_dir
     policy_class = args.policy_class
     onscreen_render = args.onscreen_render
-    task_name = args.task_name
     batch_size = args.batch_size
     num_epochs = args.num_epochs
     action_offset = args.action_offset
 
     # 태스크 로드
-    is_sim = task_name.startswith("isaac_")
+    is_sim = True
     if is_sim:
         from constants import SIM_TASK_CONFIGS as CONFIGS
-    else:
-        from aloha_scripts.constants import TASK_CONFIGS as CONFIGS
-    cfg = CONFIGS[task_name]
-    dataset_dir = cfg["dataset_dir"]
-    num_episodes = cfg["num_episodes"]
-    episode_len = cfg["episode_len"]
-    raw_cameras = cfg["camera_names"]
-
     # RGB 카메라만 사용
-    camera_names = [c for c in raw_cameras if c in ["color", "left_color"]]
+    camera_names = [c for c in ["color", "left_color"] if c in ["color", "left_color"]]
 
     # 정책 구성
     backbone_lr = 1e-5
@@ -55,7 +46,6 @@ def main(args):
     }
     config = {
         "ckpt_dir": ckpt_dir,
-        "task_name": task_name,
         "seed": args.seed,
         "policy_class": policy_class,
         "policy_config": policy_config,
@@ -64,7 +54,7 @@ def main(args):
 
     # 데이터 로드
     train_loader, val_loader, stats, _ = load_data(
-        dataset_dir, num_episodes, camera_names, batch_size, batch_size, action_offset
+        './dataset/isaac_sim_example', 3, camera_names, batch_size, batch_size, action_offset
     )
 
     # 정규화 통계 저장
@@ -142,7 +132,6 @@ if __name__ == "__main__":
     p.add_argument("--onscreen_render", action="store_true")
     p.add_argument("--ckpt_dir", required=True)
     p.add_argument("--policy_class", required=True)
-    p.add_argument("--task_name", required=True)
     p.add_argument("--batch_size", type=int, required=True)
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--num_epochs", type=int, required=True)
