@@ -1,8 +1,16 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ACTPolicy 학습 스크립트
+- train_bc 함수에 tqdm 진행률 및 ETA 표시 추가
+"""
 import torch
 import os
 import pickle
 import argparse
+import time
 from copy import deepcopy
+from tqdm import tqdm
 
 from utils import load_data, set_seed
 from policy import ACTPolicy
@@ -12,7 +20,6 @@ DT = 0.02
 
 
 def main(args):
-    # 설정
     set_seed(args.seed)
     is_eval = args.eval
     ckpt_dir = args.ckpt_dir
@@ -22,23 +29,18 @@ def main(args):
     num_epochs = args.num_epochs
     action_offset = args.action_offset
 
-    # 태스크 로드
-    is_sim = True
-    if is_sim:
-        from constants import SIM_TASK_CONFIGS as CONFIGS
-    # RGB 카메라만 사용
-    camera_names = [c for c in ["color", "left_color"] if c in ["color", "left_color"]]
+    # RGB + 실험용 depth 포함
+    camera_names = [c for c in ["color", "left_color", "depth"] if c in ["color", "left_color", "depth"]]
 
     # 정책 구성
-    backbone_lr = 1e-5
     policy_config = {
         "lr": args.lr,
         "num_queries": args.chunk_size,
         "kl_weight": args.kl_weight,
         "hidden_dim": args.hidden_dim,
         "dim_feedforward": args.dim_feedforward,
-        "lr_backbone": backbone_lr,
         "backbone": "resnet18",
+        "lr_backbone": 1e-5,
         "enc_layers": 4,
         "dec_layers": 7,
         "nheads": 8,
@@ -49,26 +51,24 @@ def main(args):
         "seed": args.seed,
         "policy_class": policy_class,
         "policy_config": policy_config,
-        "real_robot": not is_sim,
+        "real_robot": False,
+        "num_epochs": num_epochs,
     }
 
     # 데이터 로드
     train_loader, val_loader, stats, _ = load_data(
-        './dataset/isaac_sim_example', 3, camera_names, batch_size, batch_size, action_offset
+        './dataset/isaac_sim_example', 99, camera_names,
+        batch_size, batch_size, action_offset
     )
 
-    # 정규화 통계 저장
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, "dataset_stats.pkl"), "wb") as f:
         pickle.dump(stats, f)
 
-    # 평가 모드
     if is_eval:
-        # eval_bc 함수 필요시 구현
         print("Eval 모드는 아직 지원되지 않습니다.")
         return
 
-    # 학습
     best = train_bc(train_loader, val_loader, config)
     epoch, loss, state = best
     torch.save(state, os.path.join(ckpt_dir, "policy_best.ckpt"))
@@ -95,33 +95,57 @@ def train_bc(train_loader, val_loader, config):
     set_seed(config["seed"])
     policy = make_policy(config["policy_class"], config["policy_config"]).cuda()
     optimizer = make_optimizer(config["policy_class"], policy)
-    best = (0, float("inf"), None)
 
-    for epoch in range(config.get("num_epochs", 1000)):
-        # Validation (running mean)
+    best = (0, float("inf"), None)
+    num_epochs = config.get("num_epochs", 1000)
+
+    # 전체 에폭 진행률 표시
+    epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="ep")
+    start_time = time.time()
+    for epoch in epoch_bar:
+        epoch_start = time.time()
+        # Validation
         policy.eval()
-        accum = {}
-        count = 0
+        val_accum = {}
+        val_count = 0
         for batch in val_loader:
             out = forward_pass(batch, policy)
-            # batch별 텐서 평균 후 CPU로 변환
             for k, v in out.items():
-                val = v.detach().cpu().mean().item()
-                accum[k] = accum.get(k, 0.0) + val
-            count += 1
-        if count == 0:
+                val_accum[k] = val_accum.get(k, 0.0) + v.detach().cpu().mean().item()
+            val_count += 1
+        if val_count == 0:
             raise RuntimeError("Validation loader가 비어있습니다.")
-        vs = {k: accum[k] / count for k in accum}
-        if vs.get("loss", float("inf")) < best[1]:
-            best = (epoch, vs["loss"], deepcopy(policy.state_dict()))
+        val_stats = {k: val_accum[k] / val_count for k in val_accum}
+
+        # 최고 성능 ckpt 저장
+        val_loss = val_stats.get("loss", float("inf"))
+        if val_loss < best[1]:
+            best = (epoch, val_loss, deepcopy(policy.state_dict()))
 
         # Training
         policy.train()
+        train_loss_accum = 0.0
+        train_batches = 0
         for batch in train_loader:
             out = forward_pass(batch, policy)
             out["loss"].backward()
             optimizer.step()
             optimizer.zero_grad()
+            train_loss_accum += out["loss"].item()
+            train_batches += 1
+
+        # 에폭별 시간 및 ETA 계산
+        epoch_time = time.time() - epoch_start
+        elapsed = time.time() - start_time
+        remaining = (num_epochs - (epoch + 1)) * (elapsed / (epoch + 1))
+
+        # tqdm 정보 업데이트
+        epoch_bar.set_postfix({
+            "val_loss": f"{val_loss:.4f}",
+            "train_loss": f"{(train_loss_accum/train_batches):.4f}" if train_batches>0 else "N/A",
+            "epoch_time(s)": f"{epoch_time:.2f}",
+            "ETA(s)": f"{remaining:.1f}"
+        })
 
     return best
 
