@@ -46,7 +46,7 @@ class SampledSyncRecorder(Node):
         )
         self.declare_parameter("cam_height", 480)
         self.declare_parameter("cam_width", 640)
-        self.declare_parameter("sample_rate", 10.0)
+        self.declare_parameter("sample_rate", 30.0)
         base = self.get_parameter("output_dir").get_parameter_value().string_value
         self.root = os.path.expanduser(base)
         os.makedirs(self.root, exist_ok=True)
