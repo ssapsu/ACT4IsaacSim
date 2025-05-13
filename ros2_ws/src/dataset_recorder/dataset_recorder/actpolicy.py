@@ -8,6 +8,7 @@ ACTPolicy 기반 ROS2 실시간 추론 노드
 - 타임 앙상블(과거 chunk_size 히스토리 가중 평균)으로 단일 액션 발행
 - joint_command, cmd_vel 토픽에 발행
 - tabulate 라이브러리로 표 형태 로깅
+- cmd_vel 예측값이 표준편차 이내일 경우 (평균 언저리) 0,0 전송
 """
 import os
 import sys
@@ -40,12 +41,12 @@ def parse_args():
     parser.add_argument("--ckpt_dir", default="/home/hyeonsu/Documents/ACT4IsaacSim/ckpt")
     parser.add_argument("--ckpt_name", default="policy_best.ckpt")
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--camera_names", nargs="+", default=["color", "left_color", "depth"])
+    parser.add_argument("--camera_names", nargs="+", default=["color", "left_color", "CCTV_color", "arm_color"])
     parser.add_argument("--chunk_size", type=int, default=20)
     parser.add_argument("--kl_weight", type=float, default=10.0)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--dim_feedforward", type=int, default=3200)
-    parser.add_argument("--sample_rate", type=float, default=10.0)
+    parser.add_argument("--dim_feedforward", type=int, default=4096)
+    parser.add_argument("--sample_rate", type=float, default=20.0)
     parser.add_argument("--stats_file", default="dataset_stats.pkl")
     return parser.parse_args()
 
@@ -78,13 +79,19 @@ class AIInferenceNode(Node):
             "dim_feedforward": args.dim_feedforward,
             "backbone": "resnet18",
             "lr_backbone": 1e-5,
-            "enc_layers": 4,
-            "dec_layers": 7,
-            "nheads": 8,
+            "enc_layers": 8,
+            "dec_layers": 8,
+            "nheads": 16,
             "camera_names": args.camera_names,
         }
         self.model = ACTPolicy(policy_cfg)
-        self.model.load_state_dict(torch.load(ckpt_path))
+        # self.model.load_state_dict(torch.load(ckpt_path))
+        state_dict = torch.load(ckpt_path)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            self.get_logger().warn(f"Unexpected keys in state_dict: {unexpected}")
+        if missing:
+            self.get_logger().warn(f"Missing keys in state_dict: {missing}")
         self.model.cuda().eval()
 
         # 정규화 통계 로드
@@ -101,6 +108,11 @@ class AIInferenceNode(Node):
         else:
             self.qpos_mean = torch.tensor(stats["qpos_mean"], dtype=torch.float32).cuda()
             self.qpos_std  = torch.tensor(stats["qpos_std"], dtype=torch.float32).cuda()
+
+        # cmd_vel 필터용 임계치 설정 (속도에 대한 표준편차)
+        # qpos_std 구조: [..., vel_std_linear, vel_std_angular]
+        self.threshold_lin = float(self.qpos_std[-2].item())
+        self.threshold_ang = float(self.qpos_std[-1].item())
 
         # 퍼블리셔 및 구독
         self.joint_pub = self.create_publisher(JointState, 'joint_command', 10)
@@ -214,14 +226,20 @@ class AIInferenceNode(Node):
         action_t = action_norm * self.qpos_std + self.qpos_mean
         action = action_t.cpu().numpy()
 
-        slider_idx = len(self.joint_names)-1
+        slider_idx = len(self.joint_names) - 1
         slider_val = action[slider_idx]
         v = -1.0 if slider_val < 1e-4 else 0.01
 
         position_cmd = action[:len(self.joint_names)].tolist()
         position_cmd[slider_idx] = 0.0
-        velocity_cmd = [0.0]*len(self.joint_names)
+        velocity_cmd = [0.0] * len(self.joint_names)
         velocity_cmd[slider_idx] = v
+
+        # cmd_vel 예측값이 표준편차 이내면 평균 언저리로 보고 0,0 전송
+        pred_lin = float(action[-2])
+        pred_ang = float(action[-1])
+        if abs(pred_lin) < self.threshold_lin and abs(pred_ang) < self.threshold_ang:
+            pred_lin, pred_ang = 0.0, 0.0
 
         # JointState 퍼블리시
         js = JointState()
@@ -233,8 +251,6 @@ class AIInferenceNode(Node):
         self.joint_pub.publish(js)
 
         # Twist 퍼블리시
-        pred_lin = float(action[-2])
-        pred_ang = float(action[-1])
         tw = Twist()
         tw.linear.x  = pred_lin
         tw.angular.z = pred_ang
