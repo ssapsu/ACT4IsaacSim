@@ -33,7 +33,7 @@ def main(args):
     patience = args.patience
     action_offset = args.action_offset
 
-    camera_names = [c for c in ["color", "left_color", "depth"] if c in ["color", "left_color", "depth"]]
+    camera_names = [c for c in ["color", "left_color", "arm_color"] if c in ["color", "left_color", "CCTV_color", "arm_color"]]
 
     policy_config = {
         "lr": args.lr,
@@ -43,9 +43,9 @@ def main(args):
         "dim_feedforward": args.dim_feedforward,
         "backbone": "resnet18",
         "lr_backbone": 1e-5,
-        "enc_layers": 4,
-        "dec_layers": 7,
-        "nheads": 8,
+        "enc_layers": 8,
+        "dec_layers": 8,
+        "nheads": 16,
         "camera_names": camera_names,
     }
     config = {
@@ -59,7 +59,7 @@ def main(args):
     }
 
     train_loader, val_loader, stats, _ = load_data(
-        './dataset/isaac_sim_example', 149, camera_names,
+        './dataset/isaac_sim_example', 50, camera_names,
         batch_size, batch_size, action_offset
     )
 
@@ -201,6 +201,6 @@ if __name__ == "__main__":
     p.add_argument("--chunk_size", type=int, default=1)
     p.add_argument("--hidden_dim", type=int, default=256)
     p.add_argument("--dim_feedforward", type=int, default=512)
-    p.add_argument("--action_offset", type=int, default=20)
+    p.add_argument("--action_offset", type=int, default=30)
     args = p.parse_args()
     main(args)
