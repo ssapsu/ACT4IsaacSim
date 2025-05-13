@@ -7,19 +7,20 @@ ACTPolicy 기반 ROS2 실시간 추론 노드
 - 설정된 주기(sample_rate)마다 모델 추론
 - 타임 앙상블(과거 chunk_size 히스토리 가중 평균)으로 단일 액션 발행
 - joint_command, cmd_vel 토픽에 발행
+- tabulate 라이브러리로 표 형태 로깅
 """
 import os
 import sys
-import time
-import threading
 import argparse
 import pickle
+import time
 from collections import deque
 
 import cv2
 import torch
 import numpy as np
 from einops import rearrange
+from tabulate import tabulate  # pip install tabulate
 
 import rclpy
 from rclpy.node import Node
@@ -49,8 +50,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def temporal_aggregate(all_time_actions: torch.Tensor, t: int, num_queries: int, k: float = 0.01) -> torch.Tensor:
-    # 과거 예측들에서 column t를 모아 지수 가중 평균
+def temporal_aggregate(all_time_actions: torch.Tensor, t: int, k: float = 0.01) -> torch.Tensor:
     acts = all_time_actions[:, t]
     mask = torch.all(acts != 0, dim=1)
     valid = acts[mask]
@@ -102,22 +102,23 @@ class AIInferenceNode(Node):
             self.qpos_mean = torch.tensor(stats["qpos_mean"], dtype=torch.float32).cuda()
             self.qpos_std  = torch.tensor(stats["qpos_std"], dtype=torch.float32).cuda()
 
-        # 퍼블리셔 생성
+        # 퍼블리셔 및 구독
         self.joint_pub = self.create_publisher(JointState, 'joint_command', 10)
         self.twist_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.last_cmd = None
+        self.create_subscription(Twist, '/cmd_vel', self._cmd_cb, 10)
 
-        # CV Bridge 및 입력 버퍼
+        # CV Bridge 및 버퍼
         self.bridge = CvBridge()
-        self.img_buf = {c: None for c in args.camera_names}
+        self.img_buf   = {c: None for c in args.camera_names}
         self.img_stamp = None
-        self.odom_buf = deque(maxlen=200)
+        self.odom_buf  = deque(maxlen=200)
         self.joint_buf = deque(maxlen=200)
         self.joint_initialized = False
 
-        # 시간 앙상블 버퍼 초기화
+        # 앙상블 버퍼
         T = 10000
         dim = self.qpos_mean.numel()
-        # 버퍼 크기: (T 시점 × (T+chunk_size) 열 × dim)
         self.action_buffer = torch.zeros((T, T + args.chunk_size, dim), device="cuda")
         self.t_idx = 0
 
@@ -125,26 +126,27 @@ class AIInferenceNode(Node):
         qos = 10
         for cam in args.camera_names:
             self.create_subscription(
-                Image,
-                f"/camera/{cam}",
+                Image, f"/camera/{cam}",
                 lambda msg, c=cam: self.img_cb(c, msg),
                 qos
             )
         self.create_subscription(Odometry, "/odom", self.odom_cb, qos)
         self.create_subscription(JointState, "/joint_states", self.joint_cb, qos)
 
-        # 추론 타이머
+        # 타이머
         interval = 1.0 / args.sample_rate
         self.create_timer(interval, self.timer_cb)
-        self.get_logger().info(f"Inference node started @ {args.sample_rate}Hz")
+        self.get_logger().info(f"Inference started @ {args.sample_rate}Hz")
+
+    def _cmd_cb(self, msg: Twist):
+        self.last_cmd = msg
 
     def img_cb(self, cam, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         if cam == 'depth':
-            depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')  # float32
+            depth = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
             dmin, dmax = np.nanmin(depth), np.nanmax(depth)
             norm = (depth - dmin) / (dmax - dmin + 1e-6)
-            # 3채널 uint8
             rgb = (norm * 255).astype(np.uint8)
             rgb = np.stack([rgb]*3, axis=2)
         else:
@@ -157,7 +159,7 @@ class AIInferenceNode(Node):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         lin = msg.twist.twist.linear
         ang = msg.twist.twist.angular
-        self.odom_buf.append((ts, (lin.x, lin.y, lin.z), (ang.x, ang.y, ang.z)))
+        self.odom_buf.append((ts, (lin.x,lin.y,lin.z), (ang.x,ang.y,ang.z)))
 
     def joint_cb(self, msg):
         ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -175,15 +177,12 @@ class AIInferenceNode(Node):
         return None
 
     def timer_cb(self):
-        # 모든 카메라 이미지 준비 확인
         if any(v is None for v in self.img_buf.values()):
             return
         ts = self.img_stamp
-        # 이미지 텐서 생성 (batch=1)
         cams = [rearrange(self.img_buf[c][1], "H W C -> C H W") for c in self.args.camera_names]
-        img = torch.from_numpy(np.stack(cams) / 255.0).float().cuda().unsqueeze(0)
+        img = torch.from_numpy(np.stack(cams)/255.0).float().cuda().unsqueeze(0)
 
-        # 동기화된 odom/joint 가져오기
         od = self._pop(self.odom_buf, ts)
         j  = self._pop(self.joint_buf, ts)
         if j and not self.joint_initialized:
@@ -193,7 +192,6 @@ class AIInferenceNode(Node):
             self.joint_names = [names[i] for i in idxs]
             self.joint_initialized = True
 
-        # qpos 벡터 생성 및 정규화
         if j and self.joint_initialized:
             _, _, poses = j
             pos_sel = np.array(poses)[self.joint_idxs]
@@ -205,55 +203,59 @@ class AIInferenceNode(Node):
         q = ((torch.from_numpy(qvec).float().cuda() - self.qpos_mean)
              / self.qpos_std).unsqueeze(0)
 
-        # 모델 추론 및 버퍼 저장
         with torch.inference_mode():
-            out = self.model(q, img)  # shape: (1, chunk_size, dim)
-            seq = out.squeeze(0)      # (chunk_size, dim)
-            # t_idx행, 열 t_idx:t_idx+chunk_size에 저장
+            out = self.model(q, img)
+            seq = out.squeeze(0)
             self.action_buffer[self.t_idx, self.t_idx:self.t_idx + self.args.chunk_size] = seq
-            # 앙상블 계산
-            agg = temporal_aggregate(self.action_buffer, self.t_idx, self.args.chunk_size)
+            agg = temporal_aggregate(self.action_buffer, self.t_idx)
             action_norm = agg.squeeze(0)
             self.t_idx += 1
 
-        # 역정규화
         action_t = action_norm * self.qpos_std + self.qpos_mean
         action = action_t.cpu().numpy()
 
-
-        # --- 슬라이더 예측값에 따른 속도(v) 계산 ---
-        slider_idx = len(self.joint_names) - 1
+        slider_idx = len(self.joint_names)-1
         slider_val = action[slider_idx]
         v = -1.0 if slider_val < 1e-4 else 0.01
-        # ------------------------------------------
 
-        # --- position 명령 생성 (7번째 제외) ---
         position_cmd = action[:len(self.joint_names)].tolist()
-        # 슬라이더 position은 사용하지 않으므로 0 또는 무시될 값으로 설정
         position_cmd[slider_idx] = 0.0
-        # -------------------------------------
-
-        # --- velocity 명령 생성 (오직 7번째만) ---
-        velocity_cmd = [0.0] * len(self.joint_names)
+        velocity_cmd = [0.0]*len(self.joint_names)
         velocity_cmd[slider_idx] = v
-        # -------------------------------------
 
-        # JointState 메시지에 position/velocity 모두 채워서 전송
+        # JointState 퍼블리시
         js = JointState()
         js.header.stamp = self.get_clock().now().to_msg()
-        js.name = self.joint_names
+        js.name     = self.joint_names
         js.position = position_cmd
         js.velocity = velocity_cmd
-        js.effort = []  # 필요 없으면 빈 리스트
+        js.effort   = []
         self.joint_pub.publish(js)
 
-        # cmd_vel 은 그대로
+        # Twist 퍼블리시
+        pred_lin = float(action[-2])
+        pred_ang = float(action[-1])
         tw = Twist()
-        tw.linear.x  = float(action[-2])
-        tw.angular.z = float(action[-1])
+        tw.linear.x  = pred_lin
+        tw.angular.z = pred_ang
         self.twist_pub.publish(tw)
 
-        self.get_logger().info(f"t={self.t_idx}, pos={position_cmd}, vel={velocity_cmd}")
+        # tabulate로 표 출력
+        headers = ["Robot Arm (6)", "Gripper", "PredLin", "PredAng", "ActLin/ActAng"]
+        arm_str = ", ".join(f"{p:.4f}" for p in position_cmd[:6])
+        gripper_val = velocity_cmd[slider_idx]
+        act_lin = self.last_cmd.linear.x if self.last_cmd else float('nan')
+        act_ang = self.last_cmd.angular.z if self.last_cmd else float('nan')
+        row = [
+            arm_str,
+            f"{gripper_val:.4f}",
+            f"{pred_lin:.4f}",
+            f"{pred_ang:.4f}",
+            f"{act_lin:.4f}/{act_ang:.4f}"
+        ]
+        table = tabulate([row], headers, tablefmt="grid")
+        self.get_logger().info("\n" + table)
+
 
 def main():
     rclpy.init()
