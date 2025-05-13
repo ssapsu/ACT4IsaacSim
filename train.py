@@ -3,6 +3,8 @@
 """
 ACTPolicy 학습 스크립트
 - train_bc 함수에 tqdm 진행률 및 ETA 표시 추가
+- 에폭별 학습/검증 손실을 기록하고, 최종에 학습곡선 플롯 저장
+- Early Stopping 기능 추가
 """
 import torch
 import os
@@ -11,6 +13,7 @@ import argparse
 import time
 from copy import deepcopy
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from utils import load_data, set_seed
 from policy import ACTPolicy
@@ -27,12 +30,11 @@ def main(args):
     onscreen_render = args.onscreen_render
     batch_size = args.batch_size
     num_epochs = args.num_epochs
+    patience = args.patience
     action_offset = args.action_offset
 
-    # RGB + 실험용 depth 포함
     camera_names = [c for c in ["color", "left_color", "depth"] if c in ["color", "left_color", "depth"]]
 
-    # 정책 구성
     policy_config = {
         "lr": args.lr,
         "num_queries": args.chunk_size,
@@ -53,11 +55,11 @@ def main(args):
         "policy_config": policy_config,
         "real_robot": False,
         "num_epochs": num_epochs,
+        "patience": patience,
     }
 
-    # 데이터 로드
     train_loader, val_loader, stats, _ = load_data(
-        './dataset/isaac_sim_example', 99, camera_names,
+        './dataset/isaac_sim_example', 149, camera_names,
         batch_size, batch_size, action_offset
     )
 
@@ -69,10 +71,12 @@ def main(args):
         print("Eval 모드는 아직 지원되지 않습니다.")
         return
 
-    best = train_bc(train_loader, val_loader, config)
+    best, train_losses, val_losses = train_bc(train_loader, val_loader, config)
     epoch, loss, state = best
     torch.save(state, os.path.join(ckpt_dir, "policy_best.ckpt"))
     print(f"최적 에폭: {epoch}, 손실: {loss:.6f}")
+
+    plot_losses(train_losses, val_losses, ckpt_dir)
 
 
 def make_policy(pc, pcfg):
@@ -98,41 +102,51 @@ def train_bc(train_loader, val_loader, config):
 
     best = (0, float("inf"), None)
     num_epochs = config.get("num_epochs", 1000)
+    patience = config.get("patience", 10)
+    no_improve = 0
 
-    # 전체 에폭 진행률 표시
+    train_losses = []
+    val_losses = []
+
     epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="ep")
     start_time = time.time()
     for epoch in epoch_bar:
         epoch_start = time.time()
+
         # Validation
         policy.eval()
-        val_accum = {}
-        val_count = 0
+        val_accum, val_count = 0.0, 0
         for batch in val_loader:
             out = forward_pass(batch, policy)
-            for k, v in out.items():
-                val_accum[k] = val_accum.get(k, 0.0) + v.detach().cpu().mean().item()
+            val_accum += out["loss"].detach().cpu().mean().item()
             val_count += 1
         if val_count == 0:
             raise RuntimeError("Validation loader가 비어있습니다.")
-        val_stats = {k: val_accum[k] / val_count for k in val_accum}
+        val_loss = val_accum / val_count
+        val_losses.append(val_loss)
 
-        # 최고 성능 ckpt 저장
-        val_loss = val_stats.get("loss", float("inf"))
+        # Early Stopping 체크
         if val_loss < best[1]:
             best = (epoch, val_loss, deepcopy(policy.state_dict()))
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print(f"얼리 스탑핑: {patience} 에폭 동안 개선 없음. 종료.")
+                break
 
         # Training
         policy.train()
-        train_loss_accum = 0.0
-        train_batches = 0
+        train_accum, train_batches = 0.0, 0
         for batch in train_loader:
             out = forward_pass(batch, policy)
             out["loss"].backward()
             optimizer.step()
             optimizer.zero_grad()
-            train_loss_accum += out["loss"].item()
+            train_accum += out["loss"].item()
             train_batches += 1
+        train_loss = train_accum / train_batches if train_batches > 0 else float("nan")
+        train_losses.append(train_loss)
 
         # 에폭별 시간 및 ETA 계산
         epoch_time = time.time() - epoch_start
@@ -142,12 +156,34 @@ def train_bc(train_loader, val_loader, config):
         # tqdm 정보 업데이트
         epoch_bar.set_postfix({
             "val_loss": f"{val_loss:.4f}",
-            "train_loss": f"{(train_loss_accum/train_batches):.4f}" if train_batches>0 else "N/A",
+            "train_loss": f"{train_loss:.4f}",
             "epoch_time(s)": f"{epoch_time:.2f}",
             "ETA(s)": f"{remaining:.1f}"
         })
 
-    return best
+    return best, train_losses, val_losses
+
+
+def plot_losses(train_losses, val_losses, ckpt_dir):
+    """학습/검증 손실 곡선을 그려서 저장합니다."""
+    # Early stopping으로 인해 길이가 다를 수 있으므로 최소 길이 사용
+    n = min(len(train_losses), len(val_losses))
+    if n == 0:
+        print("[Warning] 기록된 에폭이 없습니다. 플롯 생략.")
+        return
+    epochs = range(1, n + 1)
+    plt.figure()
+    plt.plot(epochs, train_losses[:n], label="Train Loss")
+    plt.plot(epochs, val_losses[:n], label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training & Validation Loss")
+    plt.legend()
+    plt.grid(True)
+    save_path = os.path.join(ckpt_dir, "loss_curve.png")
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+    print(f"[Info] 손실 곡선을 저장했습니다: {save_path}")
 
 
 if __name__ == "__main__":
@@ -159,6 +195,7 @@ if __name__ == "__main__":
     p.add_argument("--batch_size", type=int, required=True)
     p.add_argument("--seed", type=int, required=True)
     p.add_argument("--num_epochs", type=int, required=True)
+    p.add_argument("--patience", type=int, default=100, help="Early stopping patience")
     p.add_argument("--lr", type=float, required=True)
     p.add_argument("--kl_weight", type=float, default=1.0)
     p.add_argument("--chunk_size", type=int, default=1)
